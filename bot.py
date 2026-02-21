@@ -24,11 +24,11 @@ NOTION_API_KEY = (os.getenv("NOTION_API_KEY") or "").strip()
 ANTHROPIC_API_KEY = (os.getenv("ANTHROPIC_API_KEY") or "").strip()
 
 NOTION_DB_IDS = {
-    "건강": (os.getenv("NOTION_HEALTH_DB_ID") or "").strip(),
-    "토론": (os.getenv("NOTION_DISCUSSION_DB_ID") or "").strip(),
-    "독서": (os.getenv("NOTION_READING_DB_ID") or "").strip(),
-    "성장": (os.getenv("NOTION_GROWTH_DB_ID") or "").strip(),
-    "리뷰": (os.getenv("NOTION_REVIEW_DB_ID") or "").strip(),
+    "health": (os.getenv("NOTION_HEALTH_DB_ID") or "").strip(),
+    "discuss": (os.getenv("NOTION_DISCUSSION_DB_ID") or "").strip(),
+    "read": (os.getenv("NOTION_READING_DB_ID") or "").strip(),
+    "growth": (os.getenv("NOTION_GROWTH_DB_ID") or "").strip(),
+    "review": (os.getenv("NOTION_REVIEW_DB_ID") or "").strip(),
 }
 
 logging.basicConfig(
@@ -81,7 +81,7 @@ def validate_multi_select(values: list, field: str) -> list:
 
 # ─── Claude 추출 프롬프트 ──────────────────────────────
 EXTRACT_PROMPTS = {
-    "건강": """다음 텍스트에서 건강 기록 정보를 추출해서 JSON만 응답하세요. 다른 텍스트는 절대 넣지 마세요.
+    "health": """다음 텍스트에서 건강 기록 정보를 추출해서 JSON만 응답하세요. 다른 텍스트는 절대 넣지 마세요.
 
 텍스트:
 {text}
@@ -100,7 +100,7 @@ EXTRACT_PROMPTS = {
   "메모": "기타 특이사항 (없으면 빈 문자열)"
 }}""",
 
-    "토론": """다음 텍스트에서 콘텐츠 토론 정보를 추출해서 JSON만 응답하세요. 다른 텍스트는 절대 넣지 마세요.
+    "discuss": """다음 텍스트에서 콘텐츠 토론 정보를 추출해서 JSON만 응답하세요. 다른 텍스트는 절대 넣지 마세요.
 
 텍스트:
 {text}
@@ -114,7 +114,7 @@ EXTRACT_PROMPTS = {
   "태그": ["태그1", "태그2", "태그3"]
 }}""",
 
-    "독서": """다음 텍스트에서 독서 기록 정보를 추출해서 JSON만 응답하세요. 다른 텍스트는 절대 넣지 마세요.
+    "read": """다음 텍스트에서 독서 기록 정보를 추출해서 JSON만 응답하세요. 다른 텍스트는 절대 넣지 마세요.
 
 텍스트:
 {text}
@@ -129,7 +129,7 @@ EXTRACT_PROMPTS = {
   "인상 깊은 문장": "인상 깊은 문장이나 구절 (없으면 빈 문자열)"
 }}""",
 
-    "성장": """다음 텍스트에서 내면 성장 기록 정보를 추출해서 JSON만 응답하세요. 다른 텍스트는 절대 넣지 마세요.
+    "growth": """다음 텍스트에서 내면 성장 기록 정보를 추출해서 JSON만 응답하세요. 다른 텍스트는 절대 넣지 마세요.
 
 텍스트:
 {text}
@@ -145,7 +145,7 @@ EXTRACT_PROMPTS = {
   "태그": ["태그1", "태그2", "태그3"]
 }}""",
 
-    "리뷰": """다음 텍스트에서 주간 리뷰 정보를 추출해서 JSON만 응답하세요. 다른 텍스트는 절대 넣지 마세요.
+    "review": """다음 텍스트에서 주간 리뷰 정보를 추출해서 JSON만 응답하세요. 다른 텍스트는 절대 넣지 마세요.
 
 텍스트:
 {text}
@@ -183,16 +183,16 @@ async def extract_data(text: str, command: str) -> dict:
     data = json.loads(match.group())
 
     # Select 필드 유효성 검증
-    if command == "건강":
+    if command == "health":
         data["컨디션"] = validate_select(data.get("컨디션", ""), "컨디션")
         data["수면"] = validate_select(data.get("수면", ""), "수면")
         data["영양제"] = validate_select(data.get("영양제", ""), "영양제", "안먹음")
-    elif command == "성장":
+    elif command == "growth":
         emotions = data.get("감정 상태", [])
         if isinstance(emotions, str):
             emotions = [emotions]
         data["감정 상태"] = validate_multi_select(emotions, "감정 상태")
-    elif command == "리뷰":
+    elif command == "review":
         data["컨디션 종합"] = validate_select(data.get("컨디션 종합", ""), "컨디션 종합")
 
     return data
@@ -200,7 +200,7 @@ async def extract_data(text: str, command: str) -> dict:
 
 # ─── 미리보기 포맷 ──────────────────────────────────────────
 def format_preview(command: str, data: dict) -> str:
-    if command == "건강":
+    if command == "health":
         return (
             f"🏥 *건강 기록 미리보기*\n\n"
             f"📅 *날짜*: {data.get('날짜', today_title())}\n"
@@ -216,7 +216,7 @@ def format_preview(command: str, data: dict) -> str:
             f"📝 *메모*: {_trunc(data.get('메모', ''))}"
         )
 
-    elif command == "토론":
+    elif command == "discuss":
         tags = " ".join(f"#{t}" for t in data.get("태그", []))
         url_line = f"\n🔗 *원본*: {data['원본URL']}" if data.get("원본URL") else ""
         return (
@@ -228,7 +228,7 @@ def format_preview(command: str, data: dict) -> str:
             f"🏷️ *태그*: {tags or '-'}"
         )
 
-    elif command == "독서":
+    elif command == "read":
         return (
             f"📚 *독서 기록 미리보기*\n\n"
             f"📌 *제목*: {data.get('제목', '-')}\n"
@@ -239,7 +239,7 @@ def format_preview(command: str, data: dict) -> str:
             f"✨ *인상 깊은 문장*: {_trunc(data.get('인상 깊은 문장', ''))}"
         )
 
-    elif command == "성장":
+    elif command == "growth":
         emotions = ", ".join(data.get("감정 상태", []))
         tags = " ".join(f"#{t}" for t in data.get("태그", []))
         return (
@@ -251,7 +251,7 @@ def format_preview(command: str, data: dict) -> str:
             f"🏷️ *태그*: {tags or '-'}"
         )
 
-    elif command == "리뷰":
+    elif command == "review":
         return (
             f"📊 *주간 리뷰 미리보기*\n\n"
             f"📌 *제목*: {data.get('제목', '-')}\n"
@@ -278,7 +278,7 @@ async def save_to_notion(command: str, data: dict) -> str:
     db_id = NOTION_DB_IDS[command]
     today = today_iso()
 
-    if command == "건강":
+    if command == "health":
         props = {
             "날짜": {"title": [{"text": {"content": data.get("날짜", today_title())}}]},
             "아침": _rt(data.get("아침")),
@@ -293,7 +293,7 @@ async def save_to_notion(command: str, data: dict) -> str:
             "메모": _rt(data.get("메모")),
         }
 
-    elif command == "토론":
+    elif command == "discuss":
         props = {
             "제목": {"title": [{"text": {"content": (data.get("제목") or "토론 기록")[:100]}}]},
             "핵심 인사이트": _rt(data.get("핵심 인사이트")),
@@ -304,7 +304,7 @@ async def save_to_notion(command: str, data: dict) -> str:
         if data.get("원본URL"):
             props["원본 콘텐츠"] = {"url": data["원본URL"]}
 
-    elif command == "독서":
+    elif command == "read":
         props = {
             "제목": {"title": [{"text": {"content": (data.get("제목") or "독서 기록")[:100]}}]},
             "책 이름": {"select": {"name": (data.get("책 이름") or "미정")[:100]}},
@@ -315,7 +315,7 @@ async def save_to_notion(command: str, data: dict) -> str:
             "날짜": {"date": {"start": today}},
         }
 
-    elif command == "성장":
+    elif command == "growth":
         emotions = data.get("감정 상태", [])
         if isinstance(emotions, str):
             emotions = [emotions]
@@ -328,7 +328,7 @@ async def save_to_notion(command: str, data: dict) -> str:
             "태그": {"multi_select": [{"name": t[:100]} for t in data.get("태그", [])[:10]]},
         }
 
-    elif command == "리뷰":
+    elif command == "review":
         props = {
             "제목": {"title": [{"text": {"content": (data.get("제목") or "주간 리뷰")[:100]}}]},
             "회사 성과": _rt(data.get("회사 성과")),
@@ -369,11 +369,11 @@ def retry_kb(sid: str) -> InlineKeyboardMarkup:
 
 # ─── 핸들러 ──────────────────────────────────────────
 COMMAND_LABELS = {
-    "건강": "🏥 건강 기록",
-    "토론": "💬 토론 기록",
-    "독서": "📚 독서 기록",
-    "성장": "🌱 성장 기록",
-    "리뷰": "📊 주간 리뷰",
+    "health": "🏥 건강 기록",
+    "discuss": "💬 토론 기록",
+    "read": "📚 독서 기록",
+    "growth": "🌱 성장 기록",
+    "review": "📊 주간 리뷰",
 }
 
 
@@ -402,7 +402,7 @@ async def handle_record(update: Update, context: ContextTypes.DEFAULT_TYPE, comm
     try:
         data = await extract_data(text, command)
 
-        if command == "건강":
+        if command == "health":
             data["날짜"] = today_title()
 
         sid = uuid.uuid4().hex[:8]
@@ -428,23 +428,23 @@ async def handle_record(update: Update, context: ContextTypes.DEFAULT_TYPE, comm
 
 
 async def cmd_health(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await handle_record(update, ctx, "건강")
+    await handle_record(update, ctx, "health")
 
 
 async def cmd_discussion(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await handle_record(update, ctx, "토론")
+    await handle_record(update, ctx, "discuss")
 
 
 async def cmd_reading(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await handle_record(update, ctx, "독서")
+    await handle_record(update, ctx, "read")
 
 
 async def cmd_growth(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await handle_record(update, ctx, "성장")
+    await handle_record(update, ctx, "growth")
 
 
 async def cmd_review(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await handle_record(update, ctx, "리뷰")
+    await handle_record(update, ctx, "review")
 
 
 async def handle_callback(update: Update, _: ContextTypes.DEFAULT_TYPE):
@@ -494,12 +494,12 @@ async def cmd_start(update: Update, _: ContextTypes.DEFAULT_TYPE):
         "Claude 프로젝트 대화 요약을\n"
         "Notion에 자동 저장하는 봇입니다.\n\n"
         "📋 *사용 가능한 명령어*\n\n"
-        "🏥 /건강 — 건강 기록 (식사/운동/컨디션)\n"
-        "💬 /토론 — 콘텐츠 토론 기록\n"
-        "📚 /독서 — 독서 기록\n"
-        "🌱 /성장 — 내면 성장 기록\n"
-        "📊 /리뷰 — 주간 리뷰\n\n"
-        "📖 /도움 — 자세한 사용법\n\n"
+        "🏥 /health — 건강 기록 (식사/운동/컨디션)\n"
+        "💬 /discuss — 콘텐츠 토론 기록\n"
+        "📚 /read — 독서 기록\n"
+        "🌱 /growth — 내면 성장 기록\n"
+        "📊 /review — 주간 리뷰\n\n"
+        "📖 /help — 자세한 사용법\n\n"
         "💡 사용법: /명령어 [Claude 대화 요약 복붙]",
         parse_mode="Markdown",
     )
@@ -512,19 +512,19 @@ async def cmd_help(update: Update, _: ContextTypes.DEFAULT_TYPE):
         "아래 명령어와 함께 전송하면\n"
         "AI가 자동 추출 후 Notion에 저장합니다.\n\n"
         "━━━━━━━━━━━━━━━\n\n"
-        "🏥 */건강* [텍스트]\n"
+        "🏥 */health* [텍스트]\n"
         "식사, 운동, 컨디션, 수면 등 자동 추출\n"
         "→ Claude ⑦번 프로젝트 요약 복붙\n\n"
-        "💬 */토론* [텍스트]\n"
+        "💬 */discuss* [텍스트]\n"
         "제목, 인사이트, 적용 포인트, 태그 추출\n"
         "→ Claude ④번 프로젝트 요약 복붙\n\n"
-        "📚 */독서* [텍스트]\n"
+        "📚 */read* [텍스트]\n"
         "책 이름, 핵심 요약, 인상 깊은 문장 추출\n"
         "→ Claude ⑤번 프로젝트 요약 복붙\n\n"
-        "🌱 */성장* [텍스트]\n"
+        "🌱 */growth* [텍스트]\n"
         "대화 요약, 인사이트, 감정 상태 추출\n"
         "→ Claude ⑥번 프로젝트 요약 복붙\n\n"
-        "📊 */리뷰* [텍스트]\n"
+        "📊 */review* [텍스트]\n"
         "성과, 잘한 것, 개선점, 다음 주 목표 추출\n"
         "→ Claude ⑨번 프로젝트 요약 복붙\n\n"
         "━━━━━━━━━━━━━━━\n\n"
@@ -555,13 +555,12 @@ def main():
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("도움", cmd_help))
     app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("건강", cmd_health))
-    app.add_handler(CommandHandler("토론", cmd_discussion))
-    app.add_handler(CommandHandler("독서", cmd_reading))
-    app.add_handler(CommandHandler("성장", cmd_growth))
-    app.add_handler(CommandHandler("리뷰", cmd_review))
+    app.add_handler(CommandHandler("health", cmd_health))
+    app.add_handler(CommandHandler("discuss", cmd_discussion))
+    app.add_handler(CommandHandler("read", cmd_reading))
+    app.add_handler(CommandHandler("growth", cmd_growth))
+    app.add_handler(CommandHandler("review", cmd_review))
     app.add_handler(CallbackQueryHandler(handle_callback))
 
     logger.info("기록봇 시작!")
