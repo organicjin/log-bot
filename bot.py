@@ -845,7 +845,7 @@ def main():
     app.add_handler(CommandHandler("read", cmd_reading))
     app.add_handler(CommandHandler("growth", cmd_growth))
     app.add_handler(CommandHandler("review", cmd_review))
-    app.add_handler(CommandHandler("주간리뷰", cmd_weekly_review_now))
+    app.add_handler(CommandHandler("weekly", cmd_weekly_review_now))
     app.add_handler(CallbackQueryHandler(handle_callback))
     # 일반 텍스트 메시지 핸들러 (chat_id 저장 + 한 줄 소감 처리)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_plain_message))
