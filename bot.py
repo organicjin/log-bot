@@ -372,34 +372,43 @@ def _week_label() -> str:
     return f"{now.month}월 {week_num}주차"
 
 
-async def fetch_notion_week_data(db_id: str, date_prop: str) -> list[dict]:
-    """Notion DB에서 이번 주 월~일 데이터를 조회"""
+async def fetch_notion_week_data(db_id: str, date_prop: str, prop_type: str = "date") -> list[dict]:
+    """Notion DB에서 이번 주 월~일 데이터를 조회.
+    prop_type: "date" (날짜 프로퍼티) 또는 "title" (건강 DB처럼 title이 날짜인 경우)
+    """
     if not db_id:
         return []
     notion = NotionClient(auth=NOTION_API_KEY)
     start, end = _week_range_kst()
     try:
-        result = await notion.databases.query(
-            database_id=db_id,
-            filter={
-                "property": date_prop,
-                "date": {"on_or_after": start},
-            },
-        )
-        # end 범위 필터 (on_or_before 추가)
-        pages = []
-        for page in result.get("results", []):
-            prop = page.get("properties", {}).get(date_prop, {})
-            date_val = None
-            if prop.get("date"):
-                date_val = prop["date"].get("start", "")
-            elif prop.get("title"):
-                # health DB는 title 프로퍼티가 날짜 역할
-                date_val = None  # title 기반은 날짜 필터로 이미 처리됨
-            if date_val and date_val > end:
-                continue
-            pages.append(page)
-        return pages if pages else result.get("results", [])
+        if prop_type == "title":
+            # 건강 DB: "날짜" 컬럼이 title 타입 ("2/22(토)" 형식)
+            # title에는 date 필터를 쓸 수 없으므로 전체 조회 후 created_time 기반 필터
+            result = await notion.databases.query(
+                database_id=db_id,
+                filter={
+                    "timestamp": "created_time",
+                    "created_time": {"on_or_after": start},
+                },
+            )
+            pages = [
+                p for p in result.get("results", [])
+                if p.get("created_time", "")[:10] <= end
+            ]
+        else:
+            # 토론/독서/성장 DB: "날짜" 컬럼이 date 타입
+            result = await notion.databases.query(
+                database_id=db_id,
+                filter={
+                    "and": [
+                        {"property": date_prop, "date": {"on_or_after": start}},
+                        {"property": date_prop, "date": {"on_or_before": end}},
+                    ]
+                },
+            )
+            pages = result.get("results", [])
+        logger.info(f"Notion 주간 데이터 조회: db={db_id[:8]}... {len(pages)}건")
+        return pages
     except Exception as e:
         logger.error(f"Notion 주간 데이터 조회 오류 ({db_id}): {e}")
         return []
@@ -466,16 +475,17 @@ async def generate_weekly_review(app) -> None:
         return
 
     # 1) 4개 DB에서 이번 주 데이터 수집
+    # (db_id, date_prop, label, prop_type)
     db_configs = [
-        (NOTION_DB_IDS["health"], "날짜", "건강"),
-        (NOTION_DB_IDS["discuss"], "날짜", "토론"),
-        (NOTION_DB_IDS["read"], "날짜", "독서"),
-        (NOTION_DB_IDS["growth"], "날짜", "성장"),
+        (NOTION_DB_IDS["health"], "날짜", "건강", "title"),   # 건강 DB: 날짜가 title 타입
+        (NOTION_DB_IDS["discuss"], "날짜", "토론", "date"),
+        (NOTION_DB_IDS["read"], "날짜", "독서", "date"),
+        (NOTION_DB_IDS["growth"], "날짜", "성장", "date"),
     ]
 
     all_summaries = []
-    for db_id, date_prop, label in db_configs:
-        pages = await fetch_notion_week_data(db_id, date_prop)
+    for db_id, date_prop, label, prop_type in db_configs:
+        pages = await fetch_notion_week_data(db_id, date_prop, prop_type)
         summary = summarize_pages(pages, label)
         all_summaries.append(summary)
 
@@ -559,18 +569,24 @@ async def generate_weekly_review(app) -> None:
         review_msg += "\n─────────────────\n💬 *이번 주 한 줄 소감이 있다면 답장해주세요!*"
 
     for cid in chat_ids:
+        sent = False
         try:
             await app.bot.send_message(
                 chat_id=cid,
                 text=review_msg,
                 parse_mode="Markdown",
             )
-        except Exception as e:
-            logger.error(f"주간 리뷰 전송 오류 (chat_id={cid}): {e}")
-            continue
+            sent = True
+        except Exception:
+            # Markdown 파싱 실패 시 plain text로 재시도
+            try:
+                await app.bot.send_message(chat_id=cid, text=review_msg)
+                sent = True
+            except Exception as e2:
+                logger.error(f"주간 리뷰 전송 오류 (chat_id={cid}): {e2}")
 
-        # 한 줄 소감 대기 상태 등록 (send_message 성공 후, try 밖에서)
-        if notion_page_id:
+        # 메시지 전송 성공했으면 한 줄 소감 대기 등록
+        if sent and notion_page_id:
             waiting_for_comment[cid] = notion_page_id
             logger.info(f"한 줄 소감 대기 등록: chat_id={cid}, page_id={notion_page_id}")
 
