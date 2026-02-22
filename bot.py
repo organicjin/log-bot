@@ -11,10 +11,14 @@ from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
+    MessageHandler,
     ContextTypes,
+    filters,
 )
 from notion_client import AsyncClient as NotionClient
 import anthropic
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 
 load_dotenv()
 
@@ -41,6 +45,8 @@ KST = timezone(timedelta(hours=9))
 DAY_NAMES = ["월", "화", "수", "목", "금", "토", "일"]
 
 sessions: dict[str, dict] = {}
+chat_ids: set[int] = set()  # 봇에 메시지 오면 자동 저장
+waiting_for_comment: dict[int, str] = {}  # chat_id → notion_page_id (한 줄 소감 대기)
 
 
 # ─── Select 필드 유효값 ──────────────────────────────────
@@ -350,6 +356,274 @@ async def save_to_notion(command: str, data: dict) -> str:
     return f"https://notion.so/{page_id}"
 
 
+# ─── 주간 자동 리뷰 ──────────────────────────────────────────
+def _week_range_kst() -> tuple[str, str]:
+    """이번 주 월요일~일요일 날짜 범위 (KST 기준 ISO 문자열)"""
+    now = datetime.now(KST)
+    monday = now - timedelta(days=now.weekday())
+    sunday = monday + timedelta(days=6)
+    return monday.strftime("%Y-%m-%d"), sunday.strftime("%Y-%m-%d")
+
+
+def _week_label() -> str:
+    """'2월 3주차' 형태의 주차 라벨 생성"""
+    now = datetime.now(KST)
+    week_num = (now.day - 1) // 7 + 1
+    return f"{now.month}월 {week_num}주차"
+
+
+async def fetch_notion_week_data(db_id: str, date_prop: str) -> list[dict]:
+    """Notion DB에서 이번 주 월~일 데이터를 조회"""
+    if not db_id:
+        return []
+    notion = NotionClient(auth=NOTION_API_KEY)
+    start, end = _week_range_kst()
+    try:
+        result = await notion.databases.query(
+            database_id=db_id,
+            filter={
+                "property": date_prop,
+                "date": {"on_or_after": start},
+            },
+        )
+        # end 범위 필터 (on_or_before 추가)
+        pages = []
+        for page in result.get("results", []):
+            prop = page.get("properties", {}).get(date_prop, {})
+            date_val = None
+            if prop.get("date"):
+                date_val = prop["date"].get("start", "")
+            elif prop.get("title"):
+                # health DB는 title 프로퍼티가 날짜 역할
+                date_val = None  # title 기반은 날짜 필터로 이미 처리됨
+            if date_val and date_val > end:
+                continue
+            pages.append(page)
+        return pages if pages else result.get("results", [])
+    except Exception as e:
+        logger.error(f"Notion 주간 데이터 조회 오류 ({db_id}): {e}")
+        return []
+
+
+def _extract_text_from_prop(prop: dict) -> str:
+    """Notion 프로퍼티에서 텍스트 추출"""
+    if prop.get("title"):
+        return "".join(t.get("plain_text", "") for t in prop["title"])
+    if prop.get("rich_text"):
+        return "".join(t.get("plain_text", "") for t in prop["rich_text"])
+    if prop.get("select"):
+        return prop["select"].get("name", "")
+    if prop.get("multi_select"):
+        return ", ".join(s.get("name", "") for s in prop["multi_select"])
+    if prop.get("date"):
+        return prop["date"].get("start", "")
+    if prop.get("url"):
+        return prop["url"] or ""
+    return ""
+
+
+def summarize_pages(pages: list[dict], label: str) -> str:
+    """페이지 목록을 텍스트 요약으로 변환"""
+    if not pages:
+        return f"[{label}] 이번 주 기록 없음"
+    lines = [f"[{label}] 총 {len(pages)}건"]
+    for i, page in enumerate(pages, 1):
+        props = page.get("properties", {})
+        parts = []
+        for key, val in props.items():
+            text = _extract_text_from_prop(val)
+            if text and text != "-":
+                parts.append(f"{key}: {text}")
+        if parts:
+            lines.append(f"  {i}. " + " / ".join(parts))
+    return "\n".join(lines)
+
+
+WEEKLY_REVIEW_PROMPT = """아래는 한 사람의 이번 주 (월~일) 기록 데이터입니다.
+이 데이터를 바탕으로 주간 리뷰를 작성해주세요.
+
+**중요 원칙**: 자책이나 부정적 판단 없이, 성장 관점으로 따뜻하게 작성해주세요.
+
+데이터:
+{data}
+
+아래 JSON 형식으로만 응답하세요. 다른 텍스트는 절대 넣지 마세요.
+{{
+  "이번 주 활동 요약": "각 카테고리별 활동을 2~3문장으로 요약",
+  "잘한 것": "데이터에서 발견된 긍정적 패턴이나 성과 (2~3가지)",
+  "아쉬운 것": "판단 없이 패턴만 언급, 자책하지 않게 (1~2가지)",
+  "다음 주 제안": "구체적이고 실현 가능한 제안 1가지",
+  "컨디션 종합": "좋음/보통/힘들었음 중 정확히 하나 (건강 데이터 기반)"
+}}"""
+
+
+async def generate_weekly_review(app) -> None:
+    """매주 일요일 19:00 KST에 실행되는 자동 주간 리뷰"""
+    logger.info("주간 자동 리뷰 시작")
+
+    if not chat_ids:
+        logger.warning("저장된 chat_id가 없어 주간 리뷰를 전송할 수 없습니다.")
+        return
+
+    # 1) 4개 DB에서 이번 주 데이터 수집
+    db_configs = [
+        (NOTION_DB_IDS["health"], "날짜", "건강"),
+        (NOTION_DB_IDS["discuss"], "날짜", "토론"),
+        (NOTION_DB_IDS["read"], "날짜", "독서"),
+        (NOTION_DB_IDS["growth"], "날짜", "성장"),
+    ]
+
+    all_summaries = []
+    for db_id, date_prop, label in db_configs:
+        pages = await fetch_notion_week_data(db_id, date_prop)
+        summary = summarize_pages(pages, label)
+        all_summaries.append(summary)
+
+    combined_data = "\n\n".join(all_summaries)
+
+    # 2) Claude AI로 주간 리뷰 생성
+    try:
+        client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+        prompt = WEEKLY_REVIEW_PROMPT.format(data=combined_data)
+
+        msg = await client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=2000,
+            messages=[{"role": "user", "content": prompt}],
+        )
+
+        result_text = msg.content[0].text.strip()
+        match = re.search(r"\{.*\}", result_text, re.DOTALL)
+        if not match:
+            raise ValueError("Claude 응답에서 JSON을 파싱할 수 없습니다.")
+
+        review = json.loads(match.group())
+    except Exception as e:
+        logger.error(f"주간 리뷰 AI 분석 오류: {e}")
+        for cid in chat_ids:
+            try:
+                await app.bot.send_message(
+                    chat_id=cid,
+                    text=f"❌ 주간 자동 리뷰 생성 중 오류가 발생했습니다.\n\n`{e}`",
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                pass
+        return
+
+    review["컨디션 종합"] = validate_select(review.get("컨디션 종합", ""), "컨디션 종합")
+    week_label = _week_label()
+    title = f"{week_label} 자동 리뷰"
+
+    # 3) Notion에 저장
+    page_url = ""
+    try:
+        notion = NotionClient(auth=NOTION_API_KEY)
+        db_id = NOTION_DB_IDS.get("review")
+        if db_id:
+            today = today_iso()
+            props = {
+                "제목": {"title": [{"text": {"content": title}}]},
+                "회사 성과": _rt(review.get("이번 주 활동 요약")),
+                "개인 성과": _rt(review.get("이번 주 활동 요약")),
+                "잘한 것": _rt(review.get("잘한 것")),
+                "개선할 것": _rt(review.get("아쉬운 것")),
+                "다음 주 핵심 목표": _rt(review.get("다음 주 제안")),
+                "컨디션 종합": {"select": {"name": review.get("컨디션 종합", "보통")}},
+                "날짜": {"date": {"start": today}},
+            }
+            page = await notion.pages.create(
+                parent={"database_id": db_id},
+                properties=props,
+            )
+            page_id = page["id"].replace("-", "")
+            page_url = f"https://notion.so/{page_id}"
+    except Exception as e:
+        logger.error(f"주간 리뷰 Notion 저장 오류: {e}")
+
+    # 4) 텔레그램으로 리뷰 전송
+    review_msg = (
+        f"📊 *{title}*\n\n"
+        f"📋 *이번 주 활동 요약*\n{review.get('이번 주 활동 요약', '-')}\n\n"
+        f"⭐ *잘한 것*\n{review.get('잘한 것', '-')}\n\n"
+        f"💭 *아쉬운 것*\n{review.get('아쉬운 것', '-')}\n\n"
+        f"🎯 *다음 주 제안*\n{review.get('다음 주 제안', '-')}\n\n"
+        f"😊 *컨디션 종합*: {review.get('컨디션 종합', '보통')}\n"
+    )
+    if page_url:
+        review_msg += f"\n🔗 [Notion에서 보기]({page_url})\n"
+
+    review_msg += "\n─────────────────\n💬 *이번 주 한 줄 소감이 있다면 답장해주세요!*"
+
+    for cid in chat_ids:
+        try:
+            await app.bot.send_message(
+                chat_id=cid,
+                text=review_msg,
+                parse_mode="Markdown",
+            )
+            # 한 줄 소감 대기 상태 등록
+            if page_url:
+                # page_id를 저장해서 나중에 업데이트에 사용
+                notion_page_id = page["id"]
+                waiting_for_comment[cid] = notion_page_id
+        except Exception as e:
+            logger.error(f"주간 리뷰 전송 오류 (chat_id={cid}): {e}")
+
+    logger.info("주간 자동 리뷰 완료")
+
+
+async def handle_weekly_comment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """한 줄 소감 답장 처리. 처리했으면 True, 아니면 False 반환"""
+    cid = update.effective_chat.id
+    if cid not in waiting_for_comment:
+        return False
+
+    comment = (update.message.text or "").strip()
+    if not comment:
+        return False
+
+    notion_page_id = waiting_for_comment.pop(cid)
+
+    try:
+        notion = NotionClient(auth=NOTION_API_KEY)
+        # 기존 "메모" 또는 별도 필드에 한 줄 소감 추가
+        await notion.pages.update(
+            page_id=notion_page_id,
+            properties={
+                "개인 성과": _rt(f"[한 줄 소감] {comment}"),
+            },
+        )
+        await update.message.reply_text(
+            f"✅ 한 줄 소감이 Notion 리뷰에 저장되었습니다!\n\n💬 \"{comment}\"",
+        )
+    except Exception as e:
+        logger.error(f"한 줄 소감 저장 오류: {e}")
+        await update.message.reply_text(
+            f"❌ 소감 저장 중 오류가 발생했습니다.\n\n`{e}`",
+            parse_mode="Markdown",
+        )
+
+    return True
+
+
+async def handle_plain_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """일반 메시지 핸들러: chat_id 저장 + 한 줄 소감 처리"""
+    cid = update.effective_chat.id
+    chat_ids.add(cid)
+
+    # 한 줄 소감 대기 중이면 처리
+    handled = await handle_weekly_comment(update, context)
+    if handled:
+        return
+
+    # 명령어가 아닌 일반 메시지는 안내
+    await update.message.reply_text(
+        "💡 명령어와 함께 텍스트를 입력해주세요.\n\n"
+        "/help 로 사용법을 확인할 수 있습니다."
+    )
+
+
 # ─── 인라인 키보드 ──────────────────────────────────────────
 def preview_kb(sid: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
@@ -379,6 +653,7 @@ COMMAND_LABELS = {
 
 async def handle_record(update: Update, context: ContextTypes.DEFAULT_TYPE, command: str):
     """모든 기록 명령어의 공통 처리 로직"""
+    chat_ids.add(update.effective_chat.id)
     text = update.message.text or ""
 
     # 명령어 접두사 제거
@@ -489,6 +764,7 @@ async def handle_callback(update: Update, _: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_start(update: Update, _: ContextTypes.DEFAULT_TYPE):
+    chat_ids.add(update.effective_chat.id)
     await update.message.reply_text(
         "👋 *기록봇에 오신 것을 환영합니다!*\n\n"
         "Claude 프로젝트 대화 요약을\n"
@@ -506,6 +782,7 @@ async def cmd_start(update: Update, _: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_help(update: Update, _: ContextTypes.DEFAULT_TYPE):
+    chat_ids.add(update.effective_chat.id)
     await update.message.reply_text(
         "📖 *기록봇 상세 사용법*\n\n"
         "Claude 프로젝트에서 대화 후 요약을 복사해서\n"
@@ -562,6 +839,20 @@ def main():
     app.add_handler(CommandHandler("growth", cmd_growth))
     app.add_handler(CommandHandler("review", cmd_review))
     app.add_handler(CallbackQueryHandler(handle_callback))
+    # 일반 텍스트 메시지 핸들러 (chat_id 저장 + 한 줄 소감 처리)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_plain_message))
+
+    # APScheduler: 매주 일요일 19:00 KST 자동 주간 리뷰
+    scheduler = AsyncIOScheduler(timezone=KST)
+    scheduler.add_job(
+        generate_weekly_review,
+        CronTrigger(day_of_week="sun", hour=19, minute=0, timezone=KST),
+        args=[app],
+        id="weekly_review",
+        name="주간 자동 리뷰",
+    )
+    scheduler.start()
+    logger.info("APScheduler 시작: 매주 일요일 19:00 KST 주간 자동 리뷰")
 
     logger.info("기록봇 시작!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
