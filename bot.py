@@ -722,6 +722,13 @@ async def cmd_review(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await handle_record(update, ctx, "review")
 
 
+async def cmd_weekly_review_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """수동 주간 리뷰 트리거 (테스트용)"""
+    chat_ids.add(update.effective_chat.id)
+    await update.message.reply_text("🔄 주간 자동 리뷰를 수동 실행합니다...")
+    await generate_weekly_review(context.application)
+
+
 async def handle_callback(update: Update, _: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -838,6 +845,7 @@ def main():
     app.add_handler(CommandHandler("read", cmd_reading))
     app.add_handler(CommandHandler("growth", cmd_growth))
     app.add_handler(CommandHandler("review", cmd_review))
+    app.add_handler(CommandHandler("주간리뷰", cmd_weekly_review_now))
     app.add_handler(CallbackQueryHandler(handle_callback))
     # 일반 텍스트 메시지 핸들러 (chat_id 저장 + 한 줄 소감 처리)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_plain_message))
