@@ -517,6 +517,7 @@ async def generate_weekly_review(app) -> None:
 
     # 3) Notion에 저장
     page_url = ""
+    notion_page_id = None
     try:
         notion = NotionClient(auth=NOTION_API_KEY)
         db_id = NOTION_DB_IDS.get("review")
@@ -536,8 +537,9 @@ async def generate_weekly_review(app) -> None:
                 parent={"database_id": db_id},
                 properties=props,
             )
-            page_id = page["id"].replace("-", "")
-            page_url = f"https://notion.so/{page_id}"
+            notion_page_id = page["id"]
+            page_url = f"https://notion.so/{notion_page_id.replace('-', '')}"
+            logger.info(f"주간 리뷰 Notion 저장 완료: {notion_page_id}")
     except Exception as e:
         logger.error(f"주간 리뷰 Notion 저장 오류: {e}")
 
@@ -553,7 +555,8 @@ async def generate_weekly_review(app) -> None:
     if page_url:
         review_msg += f"\n🔗 [Notion에서 보기]({page_url})\n"
 
-    review_msg += "\n─────────────────\n💬 *이번 주 한 줄 소감이 있다면 답장해주세요!*"
+    if notion_page_id:
+        review_msg += "\n─────────────────\n💬 *이번 주 한 줄 소감이 있다면 답장해주세요!*"
 
     for cid in chat_ids:
         try:
@@ -562,15 +565,16 @@ async def generate_weekly_review(app) -> None:
                 text=review_msg,
                 parse_mode="Markdown",
             )
-            # 한 줄 소감 대기 상태 등록
-            if page_url:
-                # page_id를 저장해서 나중에 업데이트에 사용
-                notion_page_id = page["id"]
-                waiting_for_comment[cid] = notion_page_id
         except Exception as e:
             logger.error(f"주간 리뷰 전송 오류 (chat_id={cid}): {e}")
+            continue
 
-    logger.info("주간 자동 리뷰 완료")
+        # 한 줄 소감 대기 상태 등록 (send_message 성공 후, try 밖에서)
+        if notion_page_id:
+            waiting_for_comment[cid] = notion_page_id
+            logger.info(f"한 줄 소감 대기 등록: chat_id={cid}, page_id={notion_page_id}")
+
+    logger.info(f"주간 자동 리뷰 완료 (waiting_for_comment={dict(waiting_for_comment)})")
 
 
 async def handle_weekly_comment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -611,6 +615,7 @@ async def handle_plain_message(update: Update, context: ContextTypes.DEFAULT_TYP
     """일반 메시지 핸들러: chat_id 저장 + 한 줄 소감 처리"""
     cid = update.effective_chat.id
     chat_ids.add(cid)
+    logger.info(f"일반 메시지 수신: chat_id={cid}, waiting={dict(waiting_for_comment)}")
 
     # 한 줄 소감 대기 중이면 처리
     handled = await handle_weekly_comment(update, context)
